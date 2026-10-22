@@ -70,16 +70,21 @@ bool ggml_cuda_get_tensor_n(int device,
     GGML_UNUSED(n_tensors);
     return false;
 #else
+    // Provisional dispatch values based on experiments.
+    constexpr size_t min_batch_reads = 128;
+    constexpr size_t max_bytes_per_read = 128 * 1024;
     // Collect non-empty CPU destination ranges.
     std::vector<std::pair<size_t, size_t>> ranges;
     ranges.reserve(n_tensors);
+    size_t payload_bytes = 0;
     for (size_t i = 0; i < n_tensors; ++i) {
         if (sizes[i] == 0) {
             continue;
         }
-        if (data_offsets[i] > SIZE_MAX - sizes[i]) {
+        if (data_offsets[i] > SIZE_MAX - sizes[i] || payload_bytes > SIZE_MAX - sizes[i]) {
             return false;
         }
+        payload_bytes += sizes[i];
         ranges.emplace_back(data_offsets[i], data_offsets[i] + sizes[i]);
     }
     if (ranges.empty()) {
@@ -87,6 +92,9 @@ bool ggml_cuda_get_tensor_n(int device,
     }
     const size_t n_copies = ranges.size();
     if (n_copies > SIZE_MAX / sizeof(ggml_cuda_batch_get_descriptor) || n_copies > INT_MAX) {
+        return false;
+    }
+    if (n_copies < min_batch_reads) {
         return false;
     }
     const int threads = 256;
@@ -107,6 +115,10 @@ bool ggml_cuda_get_tensor_n(int device,
     }
     const uintptr_t begin = base + ranges.front().first;
     const uintptr_t end = base + ranges.back().second;
+    const size_t bytes_per_read = payload_bytes / n_copies + (payload_bytes % n_copies != 0);
+    if (bytes_per_read > max_bytes_per_read || end - begin - payload_bytes > payload_bytes) {
+        return false;
+    }
     // Allocate per-call descriptor storage on the GPU and in pinned CPU memory; both buffers are freed on scope exit.
     const size_t bytes = n_copies * sizeof(ggml_cuda_batch_get_descriptor);
     ggml_backend_buffer_ptr descriptors(ggml_backend_buft_alloc_buffer(ggml_backend_cuda_buffer_type(device), bytes));
